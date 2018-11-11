@@ -77,6 +77,8 @@ struct admin_server adminserver;
 
 int use_cli = 1;
 
+int use_http = 1;
+
 ioa_addr cli_addr;
 int cli_addr_set = 0;
 
@@ -1210,8 +1212,7 @@ void setup_admin_thread(void)
 		bufferevent_setcb(adminserver.in_buf, admin_server_receive_message, NULL, NULL, &adminserver);
 		bufferevent_enable(adminserver.in_buf, EV_READ);
 	}
-
-	{
+	if (use_http) {
 		struct bufferevent *pair[2];
 
 		bufferevent_pair_new(adminserver.event_base, TURN_BUFFEREVENTS_OPTIONS, pair);
@@ -1412,7 +1413,7 @@ static char *get_bold_admin_title(void)
 		if(as->as_ok) {
 			if(as->as_login[0]) {
 				char *dst=sbat+strlen(sbat);
-				snprintf(dst,ADMIN_USER_MAX_LENGTH*2," admin user: <b><i>%s</i></b><br>\r\n",as->as_login);
+				snprintf(dst,ADMIN_USER_MAX_LENGTH*2+2," admin user: <b><i>%s</i></b><br>\r\n",as->as_login);
 			}
 			if(as->as_realm[0]) {
 				char *dst=sbat+strlen(sbat);

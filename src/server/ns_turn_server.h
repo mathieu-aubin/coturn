@@ -169,6 +169,12 @@ struct _turn_turnserver {
 	/* oAuth: */
 	int oauth;
 	const char* oauth_server_name;
+
+	/* HTTP-Admin-Server: */
+	int use_http;
+
+	/* Keep Address Family */
+	int keep_address_family;
 };
 
 const char * get_version(turn_turnserver *server);
@@ -212,7 +218,9 @@ void init_turn_server(turn_turnserver* server,
 				    send_https_socket_cb send_https_socket,
 				    allocate_bps_cb allocate_bps_func,
 				    int oauth,
-				    const char* oauth_server_name);
+				    const char* oauth_server_name,
+				    int use_http,
+					int keep_address_family);
 
 ioa_engine_handle turn_server_get_engine(turn_turnserver *s);
 

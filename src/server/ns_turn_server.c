@@ -34,6 +34,7 @@
 #include "ns_turn_allocation.h"
 #include "ns_turn_msg_addr.h"
 #include "ns_turn_ioalib.h"
+#include "../apps/relay/ns_ioalib_impl.h"
 
 ///////////////////////////////////////////
 
@@ -42,14 +43,19 @@
 
 ////////////////////////////////////////////////
 
-static inline int get_family(int stun_family) {
+static inline int get_family(int stun_family, ioa_engine_handle e, ioa_socket_handle client_socket) {
 	switch(stun_family) {
 	case STUN_ATTRIBUTE_REQUESTED_ADDRESS_FAMILY_VALUE_IPV4:
 		return AF_INET;
+		break;
 	case STUN_ATTRIBUTE_REQUESTED_ADDRESS_FAMILY_VALUE_IPV6:
 		return AF_INET6;
+		break;
 	case STUN_ATTRIBUTE_REQUESTED_ADDRESS_FAMILY_VALUE_DEFAULT:
-		return AF_INET;
+		if(e->default_relays && get_ioa_socket_address_family(client_socket) == AF_INET6)
+				return AF_INET6;
+		else
+				return AF_INET;
 	default:
 		return AF_INET;
 	};
@@ -58,7 +64,7 @@ static inline int get_family(int stun_family) {
 ////////////////////////////////////////////////
 
 const char * get_version(turn_turnserver *server) {
-	if(server && !server->prod) {
+	if(server && !*server->prod) {
 		return (const char *) TURN_SOFTWARE;
 	} else {
 		return (const char *) "None";
@@ -1146,6 +1152,7 @@ static int handle_turn_allocate(turn_turnserver *server,
 					*reason = (const u08bits *)"Even Port cannot be used with Dual Allocation";
 					break;
 				}
+				/* Falls through. */
 			case STUN_ATTRIBUTE_REQUESTED_ADDRESS_FAMILY: {
 				if(in_reservation_token) {
 					*err_code = 400;
@@ -1252,12 +1259,25 @@ static int handle_turn_allocate(turn_turnserver *server,
 
 				if(!(*err_code)) {
 					if(!af4 && !af6) {
-						int af4res = create_relay_connection(server, ss, lifetime,
-							STUN_ATTRIBUTE_REQUESTED_ADDRESS_FAMILY_VALUE_DEFAULT, transport,
-							even_port, in_reservation_token, &out_reservation_token,
-							err_code, reason,
-							tcp_peer_accept_connection);
-						if(af4res<0) {
+						int a_family = STUN_ATTRIBUTE_REQUESTED_ADDRESS_FAMILY_VALUE_DEFAULT;
+						if (server->keep_address_family) {
+							switch(get_ioa_socket_address_family(ss->client_socket)) {
+								case AF_INET6 :
+									a_family = STUN_ATTRIBUTE_REQUESTED_ADDRESS_FAMILY_VALUE_IPV6;
+									break;
+								case AF_INET :
+									a_family = STUN_ATTRIBUTE_REQUESTED_ADDRESS_FAMILY_VALUE_IPV4;
+									break;
+							}
+						}
+
+						int res = create_relay_connection(server, ss, lifetime,
+						a_family, transport,
+						even_port, in_reservation_token, &out_reservation_token,
+						err_code, reason,
+						tcp_peer_accept_connection);
+
+						if(res<0) {
 							set_relay_session_failure(alloc,AF_INET);
 							if(!(*err_code)) {
 								*err_code = 437;
@@ -1851,7 +1871,7 @@ static void tcp_deliver_delayed_buffer(unsent_buffer *ub, ioa_socket_handle s, t
 			} else {
 				++(ss->sent_packets);
 				ss->sent_bytes += bytes;
-				turn_report_session_usage(ss);
+				turn_report_session_usage(ss, 0);
 			}
 			pop_unsent_buffer(ub);
 		} while(!ioa_socket_tobeclosed(s) && ((i++)<MAX_UNSENT_BUFFER_SIZE));
@@ -1890,7 +1910,7 @@ static void tcp_peer_input_handler(ioa_socket_handle s, int event_type, ioa_net_
 	} else if(ss) {
 		++(ss->sent_packets);
 		ss->sent_bytes += bytes;
-		turn_report_session_usage(ss);
+		turn_report_session_usage(ss, 0);
 	}
 }
 
@@ -1929,7 +1949,7 @@ static void tcp_client_input_handler_rfc6062data(ioa_socket_handle s, int event_
 		set_ioa_socket_tobeclosed(s);
 	}
 
-	turn_report_session_usage(ss);
+	turn_report_session_usage(ss, 0);
 }
 
 static void tcp_conn_bind_timeout_handler(ioa_engine_handle e, void *arg)
@@ -4082,7 +4102,7 @@ int shutdown_client_connection(turn_turnserver *server, ts_ur_super_session *ss,
 	if (!ss)
 		return -1;
 
-	report_turn_session_info(server,ss,1);
+	turn_report_session_usage(ss, 1);
 	dec_quota(ss);
 	dec_bps(ss);
 
@@ -4217,7 +4237,7 @@ static int write_client_connection(turn_turnserver *server, ts_ur_super_session*
 		if(!skip) {
 			++(ss->sent_packets);
 			ss->sent_bytes += (u32bits)ioa_network_buffer_get_size(nbh);
-			turn_report_session_usage(ss);
+			turn_report_session_usage(ss, 0);
 		}
 
 		FUNCEND;
@@ -4306,8 +4326,10 @@ static int create_relay_connection(turn_turnserver* server,
 			addr_debug_print(server->verbose, get_local_addr_from_ioa_socket(newelem->s), "Local relay addr (RTCP)");
 
 		} else {
+			int family = get_family(address_family,server->e,ss->client_socket);
 
-			newelem = get_relay_session_ss(ss,get_family(address_family));
+			newelem = get_relay_session_ss(ss,family);
+
 
 			IOA_CLOSE_SOCKET(newelem->s);
 
@@ -4427,7 +4449,7 @@ static int read_client_connection(turn_turnserver *server,
 	if(count_usage) {
 		++(ss->received_packets);
 		ss->received_bytes += (u32bits)ioa_network_buffer_get_size(in_buffer->nbh);
-		turn_report_session_usage(ss);
+		turn_report_session_usage(ss, 0);
 	}
 
 	if (eve(server->verbose)) {
@@ -4543,32 +4565,34 @@ static int read_client_connection(turn_turnserver *server,
 		}
 
 	} else {
-		SOCKET_TYPE st = get_ioa_socket_type(ss->client_socket);
-		if(is_stream_socket(st)) {
-			if(is_http((char*)ioa_network_buffer_data(in_buffer->nbh), ioa_network_buffer_get_size(in_buffer->nbh))) {
-				const char *proto = "HTTP";
-				ioa_network_buffer_data(in_buffer->nbh)[ioa_network_buffer_get_size(in_buffer->nbh)] = 0;
-				if(st==TLS_SOCKET) {
-					proto = "HTTPS";
-					set_ioa_socket_app_type(ss->client_socket,HTTPS_CLIENT_SOCKET);
-					TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "%s: %s (%s %s) request: %s\n", __FUNCTION__, proto, get_ioa_socket_cipher(ss->client_socket), get_ioa_socket_ssl_method(ss->client_socket), (char*)ioa_network_buffer_data(in_buffer->nbh));
-					if(server->send_https_socket) {
-						TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "%s socket to be detached: 0x%lx, st=%d, sat=%d\n", __FUNCTION__,(long)ss->client_socket, get_ioa_socket_type(ss->client_socket), get_ioa_socket_app_type(ss->client_socket));
-						ioa_socket_handle new_s = detach_ioa_socket(ss->client_socket);
-						if(new_s) {
-							TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "%s new detached socket: 0x%lx, st=%d, sat=%d\n", __FUNCTION__,(long)new_s, get_ioa_socket_type(new_s), get_ioa_socket_app_type(new_s));
-							server->send_https_socket(new_s);
+		if (server->use_http) {
+			SOCKET_TYPE st = get_ioa_socket_type(ss->client_socket);
+			if(is_stream_socket(st)) {
+				if(is_http((char*)ioa_network_buffer_data(in_buffer->nbh), ioa_network_buffer_get_size(in_buffer->nbh))) {
+					const char *proto = "HTTP";
+					ioa_network_buffer_data(in_buffer->nbh)[ioa_network_buffer_get_size(in_buffer->nbh)] = 0;
+					if(st==TLS_SOCKET) {
+						proto = "HTTPS";
+						set_ioa_socket_app_type(ss->client_socket,HTTPS_CLIENT_SOCKET);
+						TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "%s: %s (%s %s) request: %s\n", __FUNCTION__, proto, get_ioa_socket_cipher(ss->client_socket), get_ioa_socket_ssl_method(ss->client_socket), (char*)ioa_network_buffer_data(in_buffer->nbh));
+						if(server->send_https_socket) {
+							TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "%s socket to be detached: 0x%lx, st=%d, sat=%d\n", __FUNCTION__,(long)ss->client_socket, get_ioa_socket_type(ss->client_socket), get_ioa_socket_app_type(ss->client_socket));
+							ioa_socket_handle new_s = detach_ioa_socket(ss->client_socket);
+							if(new_s) {
+								TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "%s new detached socket: 0x%lx, st=%d, sat=%d\n", __FUNCTION__,(long)new_s, get_ioa_socket_type(new_s), get_ioa_socket_app_type(new_s));
+								server->send_https_socket(new_s);
+							}
+							ss->to_be_closed = 1;
 						}
-						ss->to_be_closed = 1;
+					} else {
+						set_ioa_socket_app_type(ss->client_socket,HTTP_CLIENT_SOCKET);
+						if(server->verbose) {
+							TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "%s: %s request: %s\n", __FUNCTION__, proto, (char*)ioa_network_buffer_data(in_buffer->nbh));
+						}
+						handle_http_echo(ss->client_socket);
 					}
-				} else {
-					set_ioa_socket_app_type(ss->client_socket,HTTP_CLIENT_SOCKET);
-					if(server->verbose) {
-						TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "%s: %s request: %s\n", __FUNCTION__, proto, (char*)ioa_network_buffer_data(in_buffer->nbh));
-					}
-					handle_http_echo(ss->client_socket);
+					return 0;
 				}
-				return 0;
 			}
 		}
 	}
@@ -4825,7 +4849,10 @@ void init_turn_server(turn_turnserver* server,
 		send_turn_session_info_cb send_turn_session_info,
 		send_https_socket_cb send_https_socket,
 		allocate_bps_cb allocate_bps_func,
-		int oauth, const char* oauth_server_name) {
+		int oauth,
+		const char* oauth_server_name,
+		int use_http,
+		int keep_address_family) {
 
 	if (!server)
 		return;
@@ -4891,6 +4918,10 @@ void init_turn_server(turn_turnserver* server,
 	server->send_socket_to_relay = send_socket_to_relay;
 
 	server->allocate_bps_func = allocate_bps_func;
+
+	server->use_http = use_http;
+
+	server->keep_address_family = keep_address_family;
 
 	set_ioa_timer(server->e, 1, 0, timer_timeout_handler, server, 1, "timer_timeout_handler");
 }
